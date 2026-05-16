@@ -62,6 +62,8 @@ AsyncEventSource events("/events");
 unsigned long last_time = 0;
 char runtime_buffer[10];
 
+bool ledState = false;
+int waterLevel = 3;
 
 void setup() {
     Serial.begin(115200);
@@ -120,6 +122,20 @@ void setup() {
         // and set reconnect delay to 1 second
         client->send("hello!", NULL, millis(), 10000);
     });
+
+    // Handle LED toggle request
+    server.on("/toggle", HTTP_GET, [](AsyncWebServerRequest *request) {
+        Serial.println("/toggle");
+
+        ledState = !ledState;
+        //digitalWrite(ledPin, ledState);
+        request->send(200, "text/plain", ledState ? "ON" : "OFF");
+    });
+
+    // Handle LED state request
+    server.on("/state", HTTP_GET,
+              [](AsyncWebServerRequest *request) { request->send(200, "text/plain", ledState ? "ON" : "OFF"); });
+
     server.addHandler(&events);
     server.begin(); // Start server
 
@@ -151,6 +167,9 @@ void loop() {
 
     neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off / black
     delay(1000);
+
+    waterLevel++;
+    send_events_to_web_client();
 #endif
 }
 
@@ -223,26 +242,17 @@ static void ntpTime(void) {
  * @brief Handle requests from the web page.
  */
 static String processor(const String &var) {
+    Serial.print("processor: ");
     Serial.println(var);
 
-    if (var == "DISKSPACE") {
-        return String(audio_guestbook_data.disk_remaining);
-    } else if (var == "STATUS") {
-        if (audio_guestbook_data.mode == READY) {
-            return "READY";
-        } else if (audio_guestbook_data.mode == RECORDING || audio_guestbook_data.mode == RECORDMESSAGEPROMPT) {
-            return "RECORDING";
-        } else if (audio_guestbook_data.mode == PLAYING) {
-            return "PLAYING";
-        } else if (audio_guestbook_data.mode == INITIALISING) {
-            return "INITIALISING";
-        } else {
-            return "ERROR";
-        }
-    } else if (var == "RECORDINGS") {
-        return String(audio_guestbook_data.recordings);
-    } else if (var == "RUNTIME") {
+    if (var == "RUNTIME") {
         return String(runtime_buffer);
+    }
+    else if (var == "STATE") {
+        return ledState ? "ON" : "OFF";
+    } else if (var == "LEVEL") {
+        waterLevel++;
+        return String(waterLevel);
     }
 
     return String();
@@ -253,21 +263,24 @@ static String processor(const String &var) {
  */
 static void send_events_to_web_client(void) {
     events.send("ping", NULL, millis());
-    events.send(String(audio_guestbook_data.disk_remaining).c_str(), "diskspace", millis());
 
-    if (audio_guestbook_data.mode == READY) {
-        events.send("READY", "status", millis());
-    } else if (audio_guestbook_data.mode == RECORDING || audio_guestbook_data.mode == RECORDMESSAGEPROMPT) {
-        events.send("RECORDING", "status", millis());
-    } else if (audio_guestbook_data.mode == PLAYING) {
-        events.send("PLAYING", "status", millis());
-    } else if (audio_guestbook_data.mode == INITIALISING) {
-        events.send("INITIALISING", "status", millis());
-    } else {
-        events.send("ERROR", "status", millis());
-    }
+    // events.send(String(audio_guestbook_data.disk_remaining).c_str(), "diskspace", millis());
 
-    events.send(String(audio_guestbook_data.recordings).c_str(), "recordings", millis());
+    // if (audio_guestbook_data.mode == READY) {
+    //     events.send("READY", "status", millis());
+    // } else if (audio_guestbook_data.mode == RECORDING || audio_guestbook_data.mode == RECORDMESSAGEPROMPT) {
+    //     events.send("RECORDING", "status", millis());
+    // } else if (audio_guestbook_data.mode == PLAYING) {
+    //     events.send("PLAYING", "status", millis());
+    // } else if (audio_guestbook_data.mode == INITIALISING) {
+    //     events.send("INITIALISING", "status", millis());
+    // } else {
+    //     events.send("ERROR", "status", millis());
+    // }
+
+    // events.send(String(audio_guestbook_data.recordings).c_str(), "recordings", millis());
+
+    events.send(String(waterLevel), "waterLevel", millis());
 
     // So the user knows the application is still running!
     last_time = millis();

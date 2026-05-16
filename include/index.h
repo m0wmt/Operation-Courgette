@@ -12,6 +12,8 @@ const char MAIN_page[] PROGMEM = R"=====(
     .card { background-color: white; box-shadow: 2px 2px 12px 1px rgba(140,140,140,.5); }
     .cards { max-width: 800px; margin: 0 auto; display: grid; grid-gap: 2rem; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
     .reading { font-size: 1.3rem; }
+    .button { background-color: teal; border: none; color: white; padding: 14px 35px; text-decoration: none; font-size: 32px; cursor: pointer; margin: 3px; 
+        border-radius: 5px; box-shadow:0 8px 16px 0 rgba(0,0,0,0.6)}
   </style>
 </head>
 <body>
@@ -19,51 +21,72 @@ const char MAIN_page[] PROGMEM = R"=====(
     <h1>Operation Courgette</h1>
   </div>
   <div class="content">
-    <div class="cards">
-      <div class="card">
-        <p style="color:rgb(10, 66, 64);">LAST WATERED</p><p><span class="reading"><span id="stat">%STATUS%</span></span></p>
-      </div>
-      <div class="card">
-        <p style="color:rgb(10, 66, 64);">WATER LEVEL</p><p><span class="reading"><span id="rec">%RECORDINGS%</span></span></p>
-      </div>
+
       <div class="card">
         <p style="color:rgb(10, 66, 64);">RUN TIME</p>
         <p><span class="reading">
           <span id="rt">%RUNTIME%</span>
         </span></p>
       </div>
-    </div>
+
+    <p>Water Level: <span id="waterLevel">%LEVEL%</span></p>
+    <p></p>
+
+    <p>LED State: <span id="ledState">%STATE%</span></p>
+
+    <button class="button" onclick="toggleLED()">Toggle LED</button>
+
   </div>
 <script>
-if (!!window.EventSource) {
+
+  function toggleLED() {
+    var xhttp = new XMLHttpRequest();
+    xhttp.open("GET", "/toggle", true);
+    xhttp.send();
+  }
+
+  function updateLEDState(state) {
+    document.getElementById("ledState").innerText = state;
+  }
+
+  function updateWATERLevel(level) {
+    document.getElementById("waterLevel").innerText = level;
+  }
+
+  // Initial state update
+  setInterval(function() {
+    var xhttp = new XMLHttpRequest();
+    xhttp.onreadystatechange = function() {
+      if (this.readyState == 4 && this.status == 200) {
+        updateLEDState(this.responseText);
+      }
+    };
+    xhttp.open("GET", "/state", true);
+    xhttp.send();
+
+    // xhttp.onreadystatechange = function() {
+    //   if (this.readyState == 4 && this.status == 200) {
+    //     updateWATERLevel(this.responseText);
+    //   }
+    // };
+    // xhttp.open("GET", "/level", true);
+    // xhttp.send();
+
+
+  }, 1000);
+
+  if (!!window.EventSource) {
  var source = new EventSource('/events');
  
- source.addEventListener('open', function(e) {
-  console.log("Events Connected");
- }, false);
- source.addEventListener('error', function(e) {
-  if (e.target.readyState != EventSource.OPEN) {
-    console.log("Events Disconnected");
-  }
- }, false);
- 
- source.addEventListener('message', function(e) {
-  console.log("message", e.data);
- }, false);
- 
- source.addEventListener('status', function(e) {
-  console.log("status", e.data);
-  document.getElementById("stat").innerHTML = e.data;
- }, false);
  
  source.addEventListener('recordings', function(e) {
   console.log("recordings", e.data);
   document.getElementById("rec").innerHTML = e.data;
  }, false);
  
- source.addEventListener('diskspace', function(e) {
-  console.log("diskspace", e.data);
-  document.getElementById("disk").innerHTML = e.data;
+ source.addEventListener('waterlevel', function(e) {
+  console.log("waterlevel", e.data);
+  document.getElementById("waterlevel").innerHTML = e.data;
  }, false);
 
  source.addEventListener('runtime', function(e) {
@@ -71,7 +94,6 @@ if (!!window.EventSource) {
   document.getElementById("rt").innerHTML = e.data;
  }, false);
 
-}
 </script>
 </body>
 </html>
