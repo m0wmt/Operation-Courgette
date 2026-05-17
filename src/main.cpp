@@ -32,26 +32,6 @@ static void update_local_time(void);
 #endif
 #define RGB_BUILTIN 21
 
-char time_buffer[10];
-
-typedef struct __attribute__((packed, aligned(1))) {
-    uint8_t mode;
-    uint16_t recordings;
-    uint64_t disk_remaining;
-} teensy_data_t;
-
-teensy_data_t audio_guestbook_data;
-
-typedef enum { // State of the audio guestbook
-    ERROR,
-    INITIALISING,
-    READY,
-    RECORDMESSAGEPROMPT,
-    RECORDING,
-    PLAYING
-} button_mode_t;
-// end of teensy information setup
-
 // Set web server port number to 80
 AsyncWebServer server(80);
 
@@ -60,10 +40,9 @@ AsyncEventSource events("/events");
 
 // Variables
 unsigned long last_time = 0;
-char runtime_buffer[10];
-
-bool ledState = false;
+bool irrigationState = false;
 int waterLevel = 3;
+char time_buffer[10];
 
 void setup() {
     Serial.begin(115200);
@@ -81,11 +60,13 @@ void setup() {
 
     if (enableWiFi() == true) {
 
-        Serial.printf("IP Address: %s\n", WiFi.localIP().toString());
+        //Serial.printf("IP Address: %s\n", WiFi.localIP().toString());
 
         ntpTime();
 
-        Serial.println("WiFi time setup complete...");
+        Serial.println("Time setup complete");
+
+        delay(500);
 
         disableWiFi();
 
@@ -94,14 +75,14 @@ void setup() {
     }
 
     // Connect to Wi-Fi network with SSID and password
-    Serial.println("Setting AP (Access Point)…");
+    Serial.println("Setting Up AP (Access Point)...");
 
     WiFi.mode(WIFI_MODE_AP);
 
     // Taken from config.h
     WiFi.softAP(LOCAL_SSID, LOCAL_WIFI_PASSWORD);
 
-    Serial.print("Connecting to: ");
+    Serial.print("Acces Point Created: ");
     Serial.println(LOCAL_SSID);
 
     // If connection successful show IP address in serial monitor
@@ -127,24 +108,25 @@ void setup() {
     server.on("/toggle", HTTP_GET, [](AsyncWebServerRequest *request) {
         Serial.println("/toggle");
 
-        ledState = !ledState;
+        irrigationState = !irrigationState;
         //digitalWrite(ledPin, ledState);
-        request->send(200, "text/plain", ledState ? "ON" : "OFF");
+        request->send(200, "text/plain", irrigationState ? "ON" : "OFF");
     });
 
     // Handle LED state request
     server.on("/state", HTTP_GET,
-              [](AsyncWebServerRequest *request) { request->send(200, "text/plain", ledState ? "ON" : "OFF"); });
+              [](AsyncWebServerRequest *request) { request->send(200, "text/plain", irrigationState ? "ON" : "OFF"); });
 
     server.addHandler(&events);
     server.begin(); // Start server
 
-    Serial.println("Local HTTP server started");
+    Serial.println("Program started");
     Serial.println("");
 
-    // Set up run time buffer to 5 seconds, waiting time above!
-    sprintf(runtime_buffer, "%02d:%02d:%02d", 0, 0, 5);
+    //update_local_time();
 
+    // Set up run time buffer to 5 seconds, waiting time above!
+    //sprintf(time_buffer, "%02d:%02d:%02d", 0, 0, 5);
 }
 
 void loop() {
@@ -168,7 +150,9 @@ void loop() {
     neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off / black
     delay(1000);
 
-    waterLevel++;
+    // TESTING
+    // waterLevel++;
+    // irrigationState = !irrigationState;
     send_events_to_web_client();
 #endif
 }
@@ -235,6 +219,8 @@ static void ntpTime(void) {
 
     sntp_init();
 
+    //update_local_time();
+
     Serial.println("Time set...");
 }
 
@@ -246,10 +232,10 @@ static String processor(const String &var) {
     Serial.println(var);
 
     if (var == "RUNTIME") {
-        return String(runtime_buffer);
+        return String(time_buffer);
     }
     else if (var == "STATE") {
-        return ledState ? "ON" : "OFF";
+        return irrigationState ? "ON" : "OFF";
     } else if (var == "LEVEL") {
         waterLevel++;
         return String(waterLevel);
@@ -262,36 +248,19 @@ static String processor(const String &var) {
  * @brief Send events to the web client so they can be viewed on the web page.
  */
 static void send_events_to_web_client(void) {
-    events.send("ping", NULL, millis());
+    events.send(String(waterLevel++), "waterlevel", millis());
 
-    // events.send(String(audio_guestbook_data.disk_remaining).c_str(), "diskspace", millis());
+    // // So the user knows the application is still running!
+    // last_time = millis();
 
-    // if (audio_guestbook_data.mode == READY) {
-    //     events.send("READY", "status", millis());
-    // } else if (audio_guestbook_data.mode == RECORDING || audio_guestbook_data.mode == RECORDMESSAGEPROMPT) {
-    //     events.send("RECORDING", "status", millis());
-    // } else if (audio_guestbook_data.mode == PLAYING) {
-    //     events.send("PLAYING", "status", millis());
-    // } else if (audio_guestbook_data.mode == INITIALISING) {
-    //     events.send("INITIALISING", "status", millis());
-    // } else {
-    //     events.send("ERROR", "status", millis());
-    // }
+    // sprintf(runtime_buffer, "%02d:%02d:%02d", (last_time / 1000) / 3600, ((last_time / 1000) % 3600) / 60,
+    //         ((last_time / 1000) % 3600) % 60);
 
-    // events.send(String(audio_guestbook_data.recordings).c_str(), "recordings", millis());
+    update_local_time();
+    Serial.print("Time: ");
+    Serial.printf("%s\n", time_buffer);
 
-    events.send(String(waterLevel), "waterLevel", millis());
-
-    // So the user knows the application is still running!
-    last_time = millis();
-
-    sprintf(runtime_buffer, "%02d:%02d:%02d", (last_time / 1000) / 3600, ((last_time / 1000) % 3600) / 60,
-            ((last_time / 1000) % 3600) % 60);
-
-    Serial.print("Run time: ");
-    Serial.println(runtime_buffer);
-
-    events.send(String(runtime_buffer), "runtime", millis());
+    events.send(String(time_buffer), "runtime", millis());
 }
 
 
