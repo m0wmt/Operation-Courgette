@@ -286,7 +286,7 @@ static void disableWiFi(void) {
  *
  */
 static void ntpTime(void) {
-    // According to various forums configTime on the ESP32 does not honor the TX env
+    // According to various forums configTime on the ESP32 does not honor the TZ env
     // configTime(0, 0, SNTP_TIME_SERVER);
 
     // Set timezone - London for us
