@@ -34,6 +34,7 @@ static void print_state(void);
 #define RGB_BUILTIN 21
 
 #define IRRIGATION_GPIO_PIN 7
+
 // Set web server port number to 80
 AsyncWebServer server(80);
 
@@ -45,22 +46,43 @@ unsigned long last_time = 0;
 bool irrigationState = false;
 int waterLevel = 3;
 char time_buffer[10];
+uint32_t watering_timer = 0;    // How long we've been watering for
+uint16_t update_timer = 0;      // How long we've been going - triggers when == update_webpage - ## upgrade to uint32_t if larger than 1 minute ##
+
+// Schedule time to start watering - 15:50 every day
+typedef struct WateringScheduleStruct {
+    uint8_t const hour = 10;
+    uint8_t const minute = 15;
+    bool wateringStarted = false; // stop multiple firings
+} WateringScheduleStruct;
+
+WateringScheduleStruct watering;
 
 typedef enum { // Keep track of current state of the device
     ERROR,
     INITIALISING,
     READY,
-    WATERING
+    START_WATERING,
+    WATERING,
+    STOP_WATERING
 } irrigation_state_t;
 irrigation_state_t state = INITIALISING;
 
+static const uint16_t update_webpage = 30000;   // Update web page every minute (60000). ## Any more than 1 min then upgrade to uint32_t ##
+static const uint32_t stop_watering = 120000;   // Watering time limit (in milliseconds) - 5 mins (300000)
+// 60000 = 1 min
+// 120000 =  2 mins
+// 240000 = 4 mins
+// 600000 = 10 mins
+
 void setup() {
+    // Define pin we're using to control water pump and turn it off
     pinMode(IRRIGATION_GPIO_PIN, OUTPUT);
     digitalWrite(IRRIGATION_GPIO_PIN, LOW);
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
 
     Serial.begin(115200);
     delay(5000); // delay for serial to begin, can be very slow to start serial output!
-
 
     Serial.println("\n##################################");
     Serial.println(F("ESP32 Information:"));
@@ -73,9 +95,14 @@ void setup() {
 
     Serial.println("Irrigation pin set low");
 
-    if (enableWiFi() == true) {
+    state = INITIALISING;
+    print_state();
 
-        Serial.printf("IP Address: %s\n", WiFi.localIP().toString());
+    // Enable wifi so we can retrieve the real time and update our local time.
+    if (enableWiFi() == true) {
+        // ipAddress = WiFi.localIP().toString();
+        // Serial.printf("IP Address: %s\n", ipAddress);
+        Serial.printf("IP Address: ");
         Serial.println(WiFi.localIP());
 
         //ntpTime();
@@ -87,15 +114,18 @@ void setup() {
 
         delay(500);
 
+        // Disable wifi as we're going to set up our own local access point
         disableWiFi();
 
     } else {
         Serial.println("Unable to connect to WiFi!");
+        state = ERROR;
+        print_state();
     }
 
     //printLocalTime();
 
-    // Connect to Wi-Fi network with SSID and password
+    // Set up our own local Wi-Fi network with SSID and password
     Serial.println("Setting Up AP (Access Point)...");
 
     WiFi.mode(WIFI_MODE_AP);
@@ -118,7 +148,7 @@ void setup() {
     // Handle Web Server Events
     events.onConnect([](AsyncEventSourceClient *client) {
         if (client->lastId()) {
-            Serial.printf("Client reconnected! Last message ID that it got is: %u\n", client->lastId());
+            Serial.printf("%s Client reconnected, message ID: %u\n", time_buffer, client->lastId());
         }
         // send event with message "hello!", id current millis
         // and set reconnect delay to 1 second
@@ -127,16 +157,18 @@ void setup() {
 
     // Handle LED toggle request
     server.on("/toggle", HTTP_GET, [](AsyncWebServerRequest *request) {
-        Serial.println("/toggle");
+        // Serial.println("/toggle");
 
         irrigationState = !irrigationState;
+        state = START_WATERING;
+        print_state();
         //digitalWrite(ledPin, ledState);
         request->send(200, "text/plain", irrigationState ? "ON" : "OFF");
     });
 
     // Handle LED state request
     server.on("/state", HTTP_GET,
-              [](AsyncWebServerRequest *request) { request->send(200, "text/plain", irrigationState ? "ON" : "OFF"); });
+              [](AsyncWebServerRequest *request) { request->send(200, "text/plain", irrigationState ? "WATERING" : "OFF"); });
 
     server.addHandler(&events);
     server.begin(); // Start server
@@ -145,91 +177,144 @@ void setup() {
     Serial.println("Irrigation pin set low");
 
     Serial.println("Program started");
+    //update_local_time();
     Serial.println("");
+
+    send_events_to_web_client();
 
     //update_local_time();
 
     // Set up run time buffer to 5 seconds, waiting time above!
     //sprintf(time_buffer, "%02d:%02d:%02d", 0, 0, 5);
 
-    state = READY;
 }
 
 void loop() {
-#ifdef RGB_BUILTIN
-    delay(4000);
-    neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
+    static uint32_t webTimer = 0;
+    static uint32_t wateringTimer = 0;
 
-    Serial.println("Pin set high");
-    digitalWrite(IRRIGATION_GPIO_PIN, HIGH);
+    // #ifdef RGB_BUILTIN
+    //     delay(4000);
+    //     neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
 
-    //printLocalTime();
+    //     Serial.println("Pin set high");
+    //     digitalWrite(IRRIGATION_GPIO_PIN, HIGH);
 
-    update_local_time();
-    Serial.print("Time: ");
-    Serial.printf("%s\n", time_buffer);
+    //     //printLocalTime();
 
-    // TESTING
-    // waterLevel++;
-    // irrigationState = !irrigationState;
-    // send_events_to_web_client();
+    //     update_local_time();
+    //     Serial.print("Time: ");
+    //     Serial.printf("%s\n", time_buffer);
 
-    delay(2000);
+    //     // TESTING
+    //     // waterLevel++;
+    //     // irrigationState = !irrigationState;
+    //     // send_events_to_web_client();
 
-    neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
-    digitalWrite(IRRIGATION_GPIO_PIN, LOW);
-    Serial.println("Irrigation pin set low");
+    //     delay(2000);
 
-    // digitalWrite(RGB_BUILTIN, HIGH);   // Turn the RGB LED white
-    // neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, RGB_BRIGHTNESS, RGB_BRIGHTNESS); // Red
-    // delay(1000);
+    //     neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
+    //     digitalWrite(IRRIGATION_GPIO_PIN, LOW);
+    //     Serial.println("Irrigation pin set low");
 
-    // neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
-    // delay(1000);
+    //     // digitalWrite(RGB_BUILTIN, HIGH);   // Turn the RGB LED white
+    //     // neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, RGB_BRIGHTNESS, RGB_BRIGHTNESS); // Red
+    //     // delay(1000);
 
-    // neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
+    //     // neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
+    //     // delay(1000);
 
-    // digitalWrite(IRRIGATION_GPIO_PIN, LOW);
-    // Serial.println("Irrigation pin set low");
+    //     // neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
 
-    // delay(1000);
+    //     // digitalWrite(IRRIGATION_GPIO_PIN, LOW);
+    //     // Serial.println("Irrigation pin set low");
 
-    // neopixelWrite(RGB_BUILTIN, 0, RGB_BRIGHTNESS, 0); // Green
-    // delay(1000);
+    //     // delay(1000);
 
-    // neopixelWrite(RGB_BUILTIN, 0, static void printLocalTime(void) {0, RGB_BRIGHTNESS); // Blue
-    // delay(1000);
+    //     // neopixelWrite(RGB_BUILTIN, 0, RGB_BRIGHTNESS, 0); // Green
+    //     // delay(1000);
 
-    // neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off / black
-    // delay(1000);
+    //     // neopixelWrite(RGB_BUILTIN, 0, 0, RGB_BRIGHTNESS); // Blue
+    //     // delay(1000);
 
-    // TESTING
-    // waterLevel++;
-    // irrigationState = !irrigationState;
-    //send_events_to_web_client();
+    //     // neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off / black
+    //     // delay(1000);
 
-#endif
+    //     // TESTING
+    //     // waterLevel++;
+    //     // irrigationState = !irrigationState;
+    //     //send_events_to_web_client();
+
+    // #endif
+    // See what mode we're in and act accordingly
     switch (state) {
         case ERROR:
             // Error message to web page
-            print_state();
+            //print_state();
             break;
 
         case INITIALISING:
-            // Program initialising - here for completeness
+            // Program initialising finished
+            state = READY;
             print_state();
+            Serial.printf("%s Starting program loop, watering scheduled for: %d:%d every day.\n", time_buffer, watering.hour, watering.minute);
+            webTimer = millis();
             break;
 
         case READY:
             // Everything okay and ready to start irrigating the courgettes.
             // Update web page that we're ready and then every nn seconds/minutes with status.
+            // update web page every minute
+            struct tm timeinfo;
+            if (getLocalTime(&timeinfo)) {
+                if (timeinfo.tm_hour == watering.hour && timeinfo.tm_min == watering.minute && !watering.wateringStarted) {
+
+                    // --- YOUR EVENT HAPPENS HERE ---
+                    update_local_time();
+                    Serial.printf("%s Daily watering of courgettes started.\n", time_buffer);
+                    // -------------------------------
+
+                    watering.wateringStarted = true; // Mark as done for today
+                    state = START_WATERING;
+                    irrigationState = !irrigationState;
+                }
+            }
+            break;
+
+        case START_WATERING:
             print_state();
+            digitalWrite(IRRIGATION_GPIO_PIN, HIGH);
+            //neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
+            neopixelWrite(RGB_BUILTIN, 0, 0, RGB_BRIGHTNESS); // Blue
+            Serial.printf("%s Water pump on, watering has started.\n", time_buffer);
+            state = WATERING;
+            print_state();
+            wateringTimer = millis();
             break;
 
         case WATERING:
             // Watering the courgettes.
             // Stop after nn seconds/minutes.
+            if (millis() - wateringTimer >= stop_watering) {
+                wateringTimer = millis();
+                waterLevel--;
+                irrigationState = !irrigationState;
+                send_events_to_web_client();
+                state = STOP_WATERING;
+                print_state();
+            }
+
+            break;
+
+        case STOP_WATERING:
+            digitalWrite(IRRIGATION_GPIO_PIN, LOW);
+            neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
+            irrigationState = !irrigationState;
+            watering.wateringStarted = false;   // reset schedule
+            Serial.printf("%s Water pump off, watering has stopped\n", time_buffer);
+            state = READY;
             print_state();
+            send_events_to_web_client();
             break;
 
         default:
@@ -238,6 +323,18 @@ void loop() {
             break;
     }
 
+    // Update web page every 30 seconds
+    if (millis() - webTimer >= update_webpage) {
+        webTimer = millis();
+        update_local_time();
+        print_state();
+        //Serial.print("Time: ");
+        //Serial.printf("Time %s\n", time_buffer);
+
+        waterLevel++;
+        //irrigationState = !irrigationState;
+        send_events_to_web_client();
+    }
 }
 
 
@@ -318,7 +415,7 @@ static String processor(const String &var) {
         return String(time_buffer);
     }
     else if (var == "STATE") {
-        return irrigationState ? "ON" : "OFF";
+        return irrigationState ? "WATERING" : "OFF";
     } else if (var == "LEVEL") {
         waterLevel++;
         return String(waterLevel);
@@ -331,7 +428,7 @@ static String processor(const String &var) {
  * @brief Send events to the web client so they can be viewed on the web page.
  */
 static void send_events_to_web_client(void) {
-    events.send(String(waterLevel++), "waterlevel", millis());
+    events.send(String(waterLevel), "waterlevel", millis());
 
     // // So the user knows the application is still running!
     // last_time = millis();
@@ -340,8 +437,8 @@ static void send_events_to_web_client(void) {
     //         ((last_time / 1000) % 3600) % 60);
 
     //update_local_time();
-    Serial.print("Time: ");
-    Serial.printf("%s\n", time_buffer);
+    //Serial.print("Time: ");
+    //Serial.printf("%s\n", time_buffer);
 
     events.send(String(time_buffer), "runtime", millis());
 }
@@ -362,7 +459,8 @@ static void update_local_time(void) {
  * @brief For debugging only, print out what state we are set to.
  */
 static void print_state(void) {
-    Serial.print("State switched to: ");
+    update_local_time();
+    Serial.printf("%s State:", time_buffer);
 
     switch (state) {
         case ERROR:
@@ -377,8 +475,16 @@ static void print_state(void) {
             Serial.println(" READY");
             break;
 
+        case START_WATERING:
+            Serial.println(" START WATERING");
+            break;
+
         case WATERING:
             Serial.println(" WATERING");
+            break;
+
+        case STOP_WATERING:
+            Serial.println( " STOP WATERING");
             break;
 
         default:
