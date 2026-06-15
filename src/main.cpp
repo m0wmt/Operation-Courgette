@@ -2,8 +2,11 @@
  * Program to control a water pump to irrigate our courgette plants.
  *
  * Using an ESP32-S3-ZERO : https://www.waveshare.com/wiki/ESP32-S3-Zero
- * 
- * 
+ *
+ * https://github.com/arkhipenko/IoT_apis2/blob/master/IoT_apis2.ino
+ * https://github.com/arkhipenko/apis/blob/master/README
+ *
+ * https://github.com/qqueke/freeRTOS-Alarm/blob/main/main.cpp - looking at this one at the mo 
  */
 #include <Arduino.h>
 // Load Wi-Fi library
@@ -17,6 +20,12 @@
 
 #include "esp32-hal-timer.h"
 
+// RTOS headers
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
+
 static bool enableWiFi(void);
 static void disableWiFi(void);
 static void ntpTime(void);
@@ -24,6 +33,18 @@ static String processor(const String &var);
 static void send_events_to_web_client(void);
 static void update_local_time(void);
 static void print_state(void);
+
+static void webTimerCallback(TimerHandle_t xTimer);
+void webTask(void *pvParameters);
+void clockTask(void *pvParameters);
+void waterTask(void *pvParameters);
+static void startWatering(void);
+static void stopWatering(void);
+
+// TEST/DEBUG defines
+// ------------------
+#define _DEBUG_
+// #define _TEST_
 
 //#define RGB_BRIGHTNESS 10 // Change white brightness (max 255)
 
@@ -35,8 +56,8 @@ static void print_state(void);
 
 #define IRRIGATION_GPIO_PIN 7
 
-// Set web server port number to 80
-AsyncWebServer server(80);
+    // Set web server port number to 80
+    AsyncWebServer server(80);
 
 // Create an Event Source on /events
 AsyncEventSource events("/events");
@@ -44,19 +65,23 @@ AsyncEventSource events("/events");
 // Variables
 unsigned long last_time = 0;
 bool irrigationState = false;
+bool isWatering = false;
 int waterLevel = 3;
 char time_buffer[10];
 uint32_t watering_timer = 0;    // How long we've been watering for
 uint16_t update_timer = 0;      // How long we've been going - triggers when == update_webpage - ## upgrade to uint32_t if larger than 1 minute ##
 
-// Schedule time to start watering - 15:50 every day
-typedef struct WateringScheduleStruct {
-    uint8_t const hour = 10;
-    uint8_t const minute = 15;
-    bool wateringStarted = false; // stop multiple firings
-} WateringScheduleStruct;
+// Schedule time to start watering - 9:15 and 15:50 every day
+// typedef struct WateringScheduleStruct {
+//     bool isWatering = false; // stop multiple firings
+//     uint8_t const WMH = 9;      // morning hour to water
+//     uint8_t const WMM = 15;     // morning minute to water
+//     uint8_t const WAH = 16;     // afternoon hour to water
+//     uint8_t const WAM = 15;     // afternoon minute to water
+//     uint8_t const duration = 5; // number of minutes to water for  
+// } WateringScheduleStruct;
+// WateringScheduleStruct watering;
 
-WateringScheduleStruct watering;
 
 typedef enum { // Keep track of current state of the device
     ERROR,
@@ -68,12 +93,38 @@ typedef enum { // Keep track of current state of the device
 } irrigation_state_t;
 irrigation_state_t state = INITIALISING;
 
-static const uint16_t update_webpage = 30000;   // Update web page every minute (60000). ## Any more than 1 min then upgrade to uint32_t ##
+typedef enum { // Keep track of current state of the device
+    IR_ERROR,
+    IR_INITIALISING,
+    IR_READY,
+    IR_START_WATERING,
+    IR_WATERING,
+    IR_STOP_WATERING
+} ir_state_t;
+
+typedef struct WateringScheduleStruct {
+    uint8_t hour;
+    uint8_t minute;
+} WateringScheduleStruct;
+WateringScheduleStruct watering[2] = {{9, 15}, {16, 14}}; // Alarm times for watering
+
+static const uint16_t update_webpage = 10000;   // Update web page every 10 seconds (10000). ## Any more than 1 min then upgrade to uint32_t ##
 static const uint32_t stop_watering = 120000;   // Watering time limit (in milliseconds) - 5 mins (300000)
+static const uint32_t watering_duration = 300000; // Watering time limit (in milliseconds) - 5 mins (300000)
 // 60000 = 1 min
 // 120000 =  2 mins
 // 240000 = 4 mins
 // 600000 = 10 mins
+
+// RTOS tasks
+TaskHandle_t webTaskHandle;
+TaskHandle_t waterTaskHandle;
+
+TimerHandle_t webTimerHandle;
+
+volatile uint8_t CLKH = 0; // Clock hours
+volatile uint8_t CLKM = 0; // Clock minutes
+volatile uint8_t CLKS = 0; // Clock seconds
 
 void setup() {
     // Define pin we're using to control water pump and turn it off
@@ -81,6 +132,7 @@ void setup() {
     digitalWrite(IRRIGATION_GPIO_PIN, LOW);
     neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
 
+#if defined(_DEBUG_)
     Serial.begin(115200);
     delay(5000); // delay for serial to begin, can be very slow to start serial output!
 
@@ -94,6 +146,7 @@ void setup() {
     Serial.println("##################################\n");
 
     Serial.println("Irrigation pin set low");
+#endif
 
     state = INITIALISING;
     print_state();
@@ -102,15 +155,19 @@ void setup() {
     if (enableWiFi() == true) {
         // ipAddress = WiFi.localIP().toString();
         // Serial.printf("IP Address: %s\n", ipAddress);
-        Serial.printf("IP Address: ");
-        Serial.println(WiFi.localIP());
+        #if defined(_DEBUG_) 
+            Serial.printf("IP Address: ");
+            Serial.println(WiFi.localIP());
+        #endif
 
         //ntpTime();
         configTime(0, 3600, SNTP_TIME_SERVER);
         //printLocalTime();
         update_local_time();
-        
-        Serial.println("Time setup complete");
+
+        #if defined(_DEBUG_)
+            Serial.println("Time setup complete");
+        #endif
 
         delay(500);
 
@@ -118,28 +175,38 @@ void setup() {
         disableWiFi();
 
     } else {
-        Serial.println("Unable to connect to WiFi!");
         state = ERROR;
-        print_state();
+        digitalWrite(IRRIGATION_GPIO_PIN, HIGH);
+        neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
+        #if defined(_DEBUG_)
+            Serial.println("Unable to connect to WiFi!");
+            print_state();
+        #endif
     }
 
     //printLocalTime();
 
     // Set up our own local Wi-Fi network with SSID and password
-    Serial.println("Setting Up AP (Access Point)...");
+    #if defined(_DEBUG_)
+        Serial.println("Setting Up AP (Access Point)...");
+    #endif
 
     WiFi.mode(WIFI_MODE_AP);
 
     // Taken from config.h
     WiFi.softAP(LOCAL_SSID, LOCAL_WIFI_PASSWORD);
 
-    Serial.print("Acces Point Created: ");
-    Serial.println(LOCAL_SSID);
+    #if defined(_DEBUG_)
+        Serial.print("Access Point Created: ");
+        Serial.println(LOCAL_SSID);
+    #endif
 
     // If connection successful show IP address in serial monitor
-    IPAddress IP = WiFi.softAPIP();
-    Serial.print("LOCAL AP IP address: ");
-    Serial.println(IP);
+    #if defined(_DEBUG_)
+        IPAddress IP = WiFi.softAPIP();
+        Serial.print("LOCAL AP IP address: ");
+        Serial.println(IP);
+    #endif
 
     // Handle Web Server
     server.on("/", HTTP_GET,
@@ -148,7 +215,9 @@ void setup() {
     // Handle Web Server Events
     events.onConnect([](AsyncEventSourceClient *client) {
         if (client->lastId()) {
-            Serial.printf("%s Client reconnected, message ID: %u\n", time_buffer, client->lastId());
+            #if defined(_DEBUG_)
+                Serial.printf("%s Client reconnected, message ID: %u\n", time_buffer, client->lastId());
+            #endif
         }
         // send event with message "hello!", id current millis
         // and set reconnect delay to 1 second
@@ -161,7 +230,9 @@ void setup() {
 
         irrigationState = !irrigationState;
         state = START_WATERING;
-        print_state();
+        #if defined(_DEBUG_)
+            print_state();
+        #endif
         //digitalWrite(ledPin, ledState);
         request->send(200, "text/plain", irrigationState ? "ON" : "OFF");
     });
@@ -174,167 +245,185 @@ void setup() {
     server.begin(); // Start server
 
     digitalWrite(IRRIGATION_GPIO_PIN, LOW);
-    Serial.println("Irrigation pin set low");
+    #if defined(_DEBUG_)
+        Serial.println("Irrigation pin set low");
+    #endif
 
-    Serial.println("Program started");
-    //update_local_time();
-    Serial.println("");
+    #if defined(_DEBUG_)
+        Serial.println("Program started");
+        Serial.println("");
+    #endif
+
+    // Create Tasks
+    // xTaskCreate(clockTask, "Clock_Task", 2*configMINIMAL_STACK_SIZE, NULL, 3, NULL);
+    xTaskCreatePinnedToCore(clockTask, "Clock_Task", 2 * configMINIMAL_STACK_SIZE, NULL, 3, NULL, 1);
+
+        // xTaskCreate(webTask, "Web_Task", 2048, NULL, 2, &webTaskHandle);
+        // xTaskCreate(waterTask, "Water Task", 2048, NULL, 2, &waterTaskHandle);
+
+        // // Create Timer (10 second period, auto-reload)
+        // webTimerHandle = xTimerCreate("Web_Timer", pdMS_TO_TICKS(10000), pdTRUE, NULL, webTimerCallback);
+        // if (webTimerHandle != NULL) {
+        //     xTimerStart(webTimerHandle, 0);
+        //     #if defined(_DEBUG_)
+        //         Serial.println("Web timer started successfully.");
+        //     #endif
+        // } else {
+        //     #if defined(_DEBUG_)
+        //         Serial.println("Web timer creation failed!");
+        //     #endif
+        // }
 
     send_events_to_web_client();
 
     //update_local_time();
 
     // Set up run time buffer to 5 seconds, waiting time above!
-    //sprintf(time_buffer, "%02d:%02d:%02d", 0, 0, 5);
+    // sprintf(time_buffer, "%02d:%02d:%02d", 0, 0, 5);
 
 }
 
 void loop() {
-    static uint32_t webTimer = 0;
-    static uint32_t wateringTimer = 0;
+    // All done in tasks
+}
 
-    // #ifdef RGB_BUILTIN
-    //     delay(4000);
-    //     neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
+/**
+ * @brief Trigger web task with this timer
+ */
+void webTimerCallback(TimerHandle_t xTimer) {
+    // Notify the LED task
+    xTaskNotifyGive(webTaskHandle);
+}
 
-    //     Serial.println("Pin set high");
-    //     digitalWrite(IRRIGATION_GPIO_PIN, HIGH);
+/**
+ * @brief Web task to update the web page
+ */
+void webTask(void *pvParameters) {
+    while (1) {
+        // Wait until web timer notifies
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-    //     //printLocalTime();
-
-    //     update_local_time();
-    //     Serial.print("Time: ");
-    //     Serial.printf("%s\n", time_buffer);
-
-    //     // TESTING
-    //     // waterLevel++;
-    //     // irrigationState = !irrigationState;
-    //     // send_events_to_web_client();
-
-    //     delay(2000);
-
-    //     neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
-    //     digitalWrite(IRRIGATION_GPIO_PIN, LOW);
-    //     Serial.println("Irrigation pin set low");
-
-    //     // digitalWrite(RGB_BUILTIN, HIGH);   // Turn the RGB LED white
-    //     // neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, RGB_BRIGHTNESS, RGB_BRIGHTNESS); // Red
-    //     // delay(1000);
-
-    //     // neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
-    //     // delay(1000);
-
-    //     // neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
-
-    //     // digitalWrite(IRRIGATION_GPIO_PIN, LOW);
-    //     // Serial.println("Irrigation pin set low");
-
-    //     // delay(1000);
-
-    //     // neopixelWrite(RGB_BUILTIN, 0, RGB_BRIGHTNESS, 0); // Green
-    //     // delay(1000);
-
-    //     // neopixelWrite(RGB_BUILTIN, 0, 0, RGB_BRIGHTNESS); // Blue
-    //     // delay(1000);
-
-    //     // neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off / black
-    //     // delay(1000);
-
-    //     // TESTING
-    //     // waterLevel++;
-    //     // irrigationState = !irrigationState;
-    //     //send_events_to_web_client();
-
-    // #endif
-    // See what mode we're in and act accordingly
-    switch (state) {
-        case ERROR:
-            // Error message to web page
-            //print_state();
-            break;
-
-        case INITIALISING:
-            // Program initialising finished
-            state = READY;
+        // Update web page
+        //update_local_time();
+        #if defined(_DEBUG_)
             print_state();
-            Serial.printf("%s Starting program loop, watering scheduled for: %d:%d every day.\n", time_buffer, watering.hour, watering.minute);
-            webTimer = millis();
-            break;
+        #endif
+        //send_events_to_web_client();
+    }
+}
 
-        case READY:
-            // Everything okay and ready to start irrigating the courgettes.
-            // Update web page that we're ready and then every nn seconds/minutes with status.
-            // update web page every minute
-            struct tm timeinfo;
-            if (getLocalTime(&timeinfo)) {
-                if (timeinfo.tm_hour == watering.hour && timeinfo.tm_min == watering.minute && !watering.wateringStarted) {
+/**
+ * @brief Water task 
+ */
+void waterTask(void *pvParameters) {
+    #if defined(_DEBUG_)
+        Serial.println("waterTask");
+    #endif
 
-                    // --- YOUR EVENT HAPPENS HERE ---
-                    update_local_time();
-                    Serial.printf("%s Daily watering of courgettes started.\n", time_buffer);
-                    // -------------------------------
+    // while (1) {
+    //     // Wait until water timer notifies
+    //     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-                    watering.wateringStarted = true; // Mark as done for today
-                    state = START_WATERING;
-                    irrigationState = !irrigationState;
+    //     // Update web page
+    //     update_local_time();
+    //     #if defined(_DEBUG_)
+    //         Serial.println("waterTask");
+    //     #endif
+    //     // send_events_to_web_client();
+    // }
+}
+
+/**
+ * @brief Clock task, runs every second
+ */
+void clockTask(void *pvParameters) { 
+    TickType_t xLastWakeTime;
+    TickType_t xStartedWatering;
+
+    // Get the current time
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        #if defined(_DEBUG_)
+            Serial.println("Failed to obtain time");
+        #endif
+    } else {
+        CLKH = timeinfo.tm_hour;
+        CLKM = timeinfo.tm_min;
+        CLKS = timeinfo.tm_sec;
+
+        Serial.printf("%d:%d:%d Clock Task Initiated\n", CLKH, CLKM, CLKS);
+    }
+
+    for ( ;; ) {
+        xLastWakeTime = xTaskGetTickCount();
+
+        // Update hours, mins and seconds
+        CLKS = (CLKS + 1) % 60;
+
+        if (CLKS == 0) {
+            CLKM = (CLKM + 1) % 60;
+
+            #if defined(_DEBUG_)
+                Serial.printf("%d:%d:00 Clock Task\n", CLKH, CLKM);
+            #endif
+
+            if (CLKM == 0) {
+                CLKH = (CLKH + 1) % 24;
+            }
+        }
+
+        if (!isWatering) {  // We're not currently watering, check if we need to start or not
+            for(int i = 0; i < 2; i++) {
+                if ((CLKH == watering[i].hour) && (CLKM == watering[i].minute) && (!isWatering)) {
+                    xStartedWatering = xTaskGetTickCount();
+                    startWatering();
+                    break;
                 }
             }
-            break;
+        }
 
-        case START_WATERING:
-            print_state();
-            digitalWrite(IRRIGATION_GPIO_PIN, HIGH);
-            //neopixelWrite(RGB_BUILTIN, RGB_BRIGHTNESS, 0, 0); // Red
-            neopixelWrite(RGB_BUILTIN, 0, 0, RGB_BRIGHTNESS); // Blue
-            Serial.printf("%s Water pump on, watering has started.\n", time_buffer);
-            state = WATERING;
-            print_state();
-            wateringTimer = millis();
-            break;
-
-        case WATERING:
-            // Watering the courgettes.
-            // Stop after nn seconds/minutes.
-            if (millis() - wateringTimer >= stop_watering) {
-                wateringTimer = millis();
-                waterLevel--;
-                irrigationState = !irrigationState;
-                send_events_to_web_client();
-                state = STOP_WATERING;
-                print_state();
+        if (isWatering) { // We're currently watering, check if we need to stop
+            if (xStartedWatering + watering_duration <= xTaskGetTickCount()) {
+                stopWatering();
             }
-
-            break;
-
-        case STOP_WATERING:
-            digitalWrite(IRRIGATION_GPIO_PIN, LOW);
-            neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
-            irrigationState = !irrigationState;
-            watering.wateringStarted = false;   // reset schedule
-            Serial.printf("%s Water pump off, watering has stopped\n", time_buffer);
-            state = READY;
-            print_state();
-            send_events_to_web_client();
-            break;
-
-        default:
-            // Should never get here!
-            Serial.println("ERROR - UNKNOWN STATE, SHOULD NOT BE HERE!");
-            break;
+        }
+           
+        // Delay for a second
+        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(1000));
     }
+    vTaskDelete(NULL);
+}
 
-    // Update web page every 30 seconds
-    if (millis() - webTimer >= update_webpage) {
-        webTimer = millis();
-        update_local_time();
-        print_state();
-        //Serial.print("Time: ");
-        //Serial.printf("Time %s\n", time_buffer);
+/**
+ * @brief Start watering!
+ */
+static void startWatering(void){
+    isWatering = true;
 
-        waterLevel++;
-        //irrigationState = !irrigationState;
-        send_events_to_web_client();
-    }
+    digitalWrite(IRRIGATION_GPIO_PIN, HIGH);
+    neopixelWrite(RGB_BUILTIN, 0, 0, RGB_BRIGHTNESS); // Blue
+
+    #if defined(_DEBUG_)
+        Serial.printf("%d:%d:%d Started Watering\n", CLKH, CLKM, CLKS);
+    #endif
+
+    send_events_to_web_client();
+}
+
+/**
+ * @brief Stop watering!
+ */
+static void stopWatering(void) {
+    isWatering = false;
+
+    digitalWrite(IRRIGATION_GPIO_PIN, LOW);
+    neopixelWrite(RGB_BUILTIN, 0, 0, 0); // Off
+
+    #if defined(_DEBUG_)
+        Serial.printf("%d:%d:%d Stopped Watering\n", CLKH, CLKM, CLKS);
+    #endif
+
+    send_events_to_web_client();
 }
 
 
@@ -365,17 +454,19 @@ static bool enableWiFi(void) {
     }
 
     return connected;
-}
+    }
 
-/**
- * @brief Disable WiFi
- *
- */
-static void disableWiFi(void) {
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+    /**
+     * @brief Disable WiFi
+     *
+     */
+    static void disableWiFi(void) {
+        WiFi.disconnect(true);
+        WiFi.mode(WIFI_OFF);
 
-    Serial.println("WiFi mode set to WIFI_OFF");
+#if defined(_DEBUG_)
+        Serial.println("WiFi mode set to WIFI_OFF");
+    #endif
 }
 
 /**
@@ -401,15 +492,19 @@ static void ntpTime(void) {
 
     //update_local_time();
 
-    Serial.println("Time set...");
+    #if defined(_DEBUG_)
+        Serial.println("Time set...");
+    #endif
 }
 
 /**
  * @brief Handle requests from the web page.
  */
 static String processor(const String &var) {
-    Serial.print("processor: ");
-    Serial.println(var);
+    #if defined(_DEBUG_)
+        Serial.print("processor: ");
+        Serial.println(var);
+    #endif
 
     if (var == "RUNTIME") {
         return String(time_buffer);
@@ -436,7 +531,7 @@ static void send_events_to_web_client(void) {
     // sprintf(runtime_buffer, "%02d:%02d:%02d", (last_time / 1000) / 3600, ((last_time / 1000) % 3600) / 60,
     //         ((last_time / 1000) % 3600) % 60);
 
-    //update_local_time();
+    update_local_time();
     //Serial.print("Time: ");
     //Serial.printf("%s\n", time_buffer);
 
@@ -447,7 +542,9 @@ static void send_events_to_web_client(void) {
 static void update_local_time(void) {
     struct tm timeinfo;
     if (!getLocalTime(&timeinfo)) {
-        Serial.println("Failed to obtain time");
+        #if defined(_DEBUG_)
+            Serial.println("Failed to obtain time");
+        #endif
         return;
     }
 
@@ -460,35 +557,39 @@ static void update_local_time(void) {
  */
 static void print_state(void) {
     update_local_time();
-    Serial.printf("%s State:", time_buffer);
+    
+    #if defined(_DEBUG_)
+        //Serial.printf("%d:%d:%d State:", CLKH, CLKM, CLKS);
+        Serial.printf("%s State:", time_buffer);
 
-    switch (state) {
-        case ERROR:
-            Serial.println(" ERROR");
-            break;
+        switch (state) {
+            case ERROR:
+                Serial.println(" ERROR");
+                break;
 
-        case INITIALISING:
-            Serial.println(" INITIALISING");
-            break;
+            case INITIALISING:
+                Serial.println(" INITIALISING");
+                break;
 
-        case READY:
-            Serial.println(" READY");
-            break;
+            case READY:
+                Serial.println(" READY");
+                break;
 
-        case START_WATERING:
-            Serial.println(" START WATERING");
-            break;
+            case START_WATERING:
+                Serial.println(" START WATERING");
+                break;
 
-        case WATERING:
-            Serial.println(" WATERING");
-            break;
+            case WATERING:
+                Serial.println(" WATERING");
+                break;
 
-        case STOP_WATERING:
-            Serial.println( " STOP WATERING");
-            break;
+            case STOP_WATERING:
+                Serial.println( " STOP WATERING");
+                break;
 
-        default:
-            Serial.println(" UNDEFINED");
-            break;
-    }
+            default:
+                Serial.println(" UNDEFINED");
+                break;
+        }
+    #endif
 }
